@@ -1,0 +1,7 @@
+# 登录状态与配置（含 token / webhook 地址，勿提交）
+data/
+settings.json
+
+# Python 缓存
+__pycache__/
+*.pyc
