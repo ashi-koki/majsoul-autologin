@@ -12,10 +12,13 @@ majsoul_auto.py —— 雀魂(https://game.maj-soul.com/1/) 自动登录脚本�
      游戏与服务端的 WebSocket 协议消息判定：
         `lq.Lobby.loginSuccess`   → 登录完成（客户端发出）
         `lq.Lobby.loginBeat`      → 大厅心跳
-     注意：loginSuccess/loginBeat 只代表「登录握手完成」，此时大厅画面往往还在加载
-     资源（实测还要再等 4~8 秒）。因此本脚本在握手完成后，再用 CDP 截屏 + 纯标准库
-     PNG 解码判断画面「近黑占比」——加载页接近全黑(>90%)，大厅五颜六色(<35%)，
-     确认画面真正渲染后才算「进入游戏主界面」。
+     注意：loginSuccess/loginBeat 只代表「登录握手完成」，此时大厅场景往往还在加载
+     （实测还要再等 4~8 秒）。因此本脚本用「双重信号」确认真正进入主界面：
+       ① 游戏逻辑信号：收到大厅初始化 fetch* 消息(fetchInfo/fetchAnnouncement 等，
+          至少 MIN_LOBBY_FETCHES 类)，说明大厅场景已加载；
+       ② 画面信号：CDP 截屏 + 纯标准库 PNG 解码判断「近黑占比」——加载页偏黑、
+          大厅五颜六色(<35%)，画面变多彩且连续稳定 2 秒才算进入主界面。
+     两者都满足才判定成功，避免「还在加载就误判」或「把登录页/开场动画当大厅」。
    - 首次登录 / 无 token 时停在登录页，`--login` 保持浏览器等你手动登录；
    - 连接不稳定（网关路由失败）时自动刷新重选线路 = 「更换信号更好的连接」；
    - 进入主界面后 POST 一个 JSON webhook 通知，再按 `--delay` 停留后关闭。
@@ -72,8 +75,11 @@ SIG_LOBBY_FETCH = (
     b"fetchActivityFlipInfo", b"fetchRollingNotice", b"fetchAchievementRate",
 )
 
-# 画面「近黑占比」阈值：加载页实测 >90%，大厅实测 <35%。低于该值即认为大厅已渲染。
-LOBBY_RENDER_MAX_DARK = 0.55
+# 进入主界面 = 登录握手完成 + 大厅场景已加载(收到大厅初始化 fetch*) + 画面渲染成大厅。
+LOBBY_RENDER_MAX_DARK = 0.55   # 大厅(多彩)近黑占比上限：低于此值视为「画面已渲染」
+RENDER_STABLE_SECONDS = 2.0    # 「画面已渲染」需连续保持的秒数(多次截屏确认)
+MIN_LOBBY_FETCHES = 3          # 收到至少这么多类大厅初始化 fetch* 消息，才认为「大厅场景已加载」
+SCREENSHOT_FAIL_WAIT = 6.0     # 截屏不可用时的兜底：大厅场景加载后再等这么久即视为进入大厅
 
 
 def _print(*args, **kwargs):
@@ -198,8 +204,8 @@ def run_until_main(port, timeout, retries, on_progress=None):
 
     monitor = LoginMonitor()
     last_report = [0.0]
-    done_since = None       # loginSuccess/loginBeat 首次出现的时间
-    last_dark = [None]      # 最近一次截屏的近黑占比（供结果摘要）
+    done_since = None          # loginSuccess/loginBeat 首次出现的时间
+    last_dark = [None]         # 最近一次截屏的近黑占比（供结果摘要）
 
     def lobby_rendered():
         """截屏并算「近黑占比」；返回 None 表示截屏不可用(解码失败/命令失败)。"""
@@ -213,9 +219,19 @@ def run_until_main(port, timeout, retries, on_progress=None):
         return ratio
 
     def _wait(deadline):
-        """等至 deadline；「登录握手完成 + 大厅画面真正渲染」后返回 True。"""
+        """等至 deadline；「登录握手 + 大厅场景已加载 + 画面渲染成大厅」后返回 True。
+
+        进入主界面的双重信号（任一都不足以单独判定，避免「还在加载就误判成功」）：
+          1. 游戏逻辑信号：登录握手完成(loginSuccess/loginBeat) 且已收到至少
+             MIN_LOBBY_FETCHES 类大厅初始化 fetch* 消息——说明大厅场景已加载；
+          2. 画面信号：CDP 截屏「近黑占比」低于 LOBBY_RENDER_MAX_DARK(大厅多彩)，
+             且连续稳定 RENDER_STABLE_SECONDS 秒。
+          截屏不可用(解码失败)时兜底：满足信号 1 后再等 SCREENSHOT_FAIL_WAIT 秒即视为进入大厅。
+        """
         nonlocal done_since
         next_shot = 0.0
+        colorful_since = None    # 连续观察到「大厅(多彩)」的起始时间
+        ready_since = None       # 「大厅场景已加载(双重信号 1)」首次成立的时间
         while time.time() < deadline:
             events = client.drain_events()
             if events:
@@ -224,26 +240,32 @@ def run_until_main(port, timeout, retries, on_progress=None):
             if on_progress and now - last_report[0] >= 5:
                 on_progress(monitor)
                 last_report[0] = now
-            if monitor.login_done:
-                if done_since is None:
-                    done_since = now
-                    next_shot = now           # 立即截第一张
+            if monitor.login_done and done_since is None:
+                done_since = now           # 记录握手完成时间(供摘要)
+            lobby_ready = (monitor.login_done
+                           and len(monitor.lobby_fetches) >= MIN_LOBBY_FETCHES)
+            if lobby_ready:
+                if ready_since is None:
+                    ready_since = now
+                    next_shot = now        # 立即截第一张
                 if now >= next_shot:
                     ratio = lobby_rendered()
                     if ratio is None:
-                        # 截屏不可用 → 回退：握手完成后再等 8 秒即视为进入大厅
-                        if now - done_since >= 8:
+                        # 截屏不可用 → 兜底：大厅场景已加载后再等 SCREENSHOT_FAIL_WAIT 秒
+                        if now - ready_since >= SCREENSHOT_FAIL_WAIT:
                             return True
                         next_shot = now + 1.0
                     elif ratio < LOBBY_RENDER_MAX_DARK:
-                        # 画面已从「加载页(全黑)」变成「大厅(多彩)」，稳定 2 秒再返回
-                        stable_until = now + 2
-                        while time.time() < stable_until:
-                            monitor.feed(client.drain_events())
-                            time.sleep(0.3)
-                        return True
+                        # 画面多彩(大厅)。连续稳定 RENDER_STABLE_SECONDS 秒即确认。
+                        if colorful_since is None:
+                            colorful_since = now
+                        elif now - colorful_since >= RENDER_STABLE_SECONDS:
+                            return True
+                        next_shot = now + 1.0
                     else:
-                        next_shot = now + 1.5   # 还没渲染完，稍后再截
+                        # 画面仍偏暗(大厅尚未渲染完)，重置候选继续等
+                        colorful_since = None
+                        next_shot = now + 1.0
             time.sleep(0.3)
         return False
 
@@ -256,6 +278,7 @@ def run_until_main(port, timeout, retries, on_progress=None):
             "route": _route_name(monitor.gateway_urls),
             "duration": round(time.time() - start, 1),
             "dark_ratio": last_dark[0],
+            "lobby_fetches": len(monitor.lobby_fetches),
             "monitor": monitor.summary(), "code": 0,
         }, 0
 
@@ -276,7 +299,7 @@ def run_until_main(port, timeout, retries, on_progress=None):
         except Exception as e:
             _print(f"[警告] 刷新失败: {e}")
             break
-        done_since = None   # 重置：新一轮握手完成的时间从零计时
+        done_since = None        # 重置：新一轮握手完成的时间从零计时
         last_dark[0] = None
         if _wait(time.time() + timeout):
             return _success(f"重试第 {attempt} 次后已进入游戏主界面")
@@ -375,7 +398,7 @@ def main(argv=None):
         if not args.json:
             _print(f"[信息] 进度: 连接={s['ws_opens']} "
                    f"登录成功={s['login_success']} 心跳={s['login_beats']} "
-                   f"错误={len(s['ws_errors'])}")
+                   f"大厅fetch={len(s['lobby_fetches'])} 错误={len(s['ws_errors'])}")
 
     result, code = run_until_main(args.port, args.timeout, args.retries,
                                   on_progress=progress)
