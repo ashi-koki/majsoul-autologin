@@ -1,6 +1,6 @@
 # 雀魂自动登录（独立版）
 
-一个**不依赖「小苏菲」exe** 的雀魂（https://game.maj-soul.com/1/ ）自动登录脚本。
+雀魂（https://game.maj-soul.com/1/ ）自动登录脚本。
 下载本包后直接运行即可：首次运行会在包内生成 `data/`（保存登录状态的 Chrome 用户目录）
 与 `settings.json`（配置），登录一次后反复调用免登录。
 
